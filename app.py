@@ -2,6 +2,7 @@
 CAMS CAS → Portfolio Excel Converter
 One-click web app: upload PDF, get Excel automatically.
 Free hosting on Streamlit Community Cloud.
+Uses the SAME proven parser as qsif_pipeline.py.
 """
 
 import io
@@ -16,7 +17,16 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 # CONFIG
 # ============================================================================
 
-QUANT_SIF_ISINS = {
+QUANT_SIF_ISINS_ORDERED = [
+    "INF966L30019",  # Equity Long-Short Fund
+    "INF966L30159",  # Equity Ex-Top 100 Long-Short Fund
+    "INF966L30274",  # Sector Rotation Long-Short Fund
+    "INF966L30241",  # Active Asset Allocator Long-Short Fund
+    "INF966L30076",  # Hybrid Long-Short Fund
+]
+QUANT_SIF_ISINS = set(QUANT_SIF_ISINS_ORDERED)
+
+QUANT_SIF_NAMES = {
     "INF966L30019": "Equity Long-Short Fund",
     "INF966L30159": "Equity Ex-Top 100 Long-Short",
     "INF966L30274": "Sector Rotation LongShort Fu",
@@ -37,16 +47,14 @@ STAMP_DUTY_RATE = 0.00005
 STT_RATE = 0.00001
 XIRR_VALUATION_DATE = datetime(2026, 7, 10)
 
-# Common CAMS PDF passwords to try if user doesn't enter one
 COMMON_PASSWORDS = ["jovi31490", "", "IPRU9999", "CAMSCAS", "CAS123", "12345678", "password"]
 
 
 # ============================================================================
-# PDF PARSING
+# PDF PARSING (mirrors qsif_pipeline.py exactly)
 # ============================================================================
 
 def extract_pdf_text(pdf_bytes: bytes, password: str = "") -> str:
-    """Try the given password first, then common defaults."""
     passwords_to_try = [password] if password else []
     passwords_to_try.extend(p for p in COMMON_PASSWORDS if p != password)
 
@@ -59,7 +67,6 @@ def extract_pdf_text(pdf_bytes: bytes, password: str = "") -> str:
             last_err = e
             continue
 
-    # If all failed, raise the last error
     raise RuntimeError(
         f"Could not open PDF with any password. Tried: {passwords_to_try}. "
         f"Last error: {last_err}"
@@ -70,84 +77,110 @@ def parse_num(s: str) -> float:
     s = s.replace(",", "").replace("(", "-").replace(")", "").strip()
     try:
         return float(s)
-    except Exception:
+    except ValueError:
         return 0.0
 
 
-def parse_date(s: str):
-    for fmt in ("%d-%b-%Y", "%d/%m/%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s.strip(), fmt)
-        except Exception:
+def parse_cas_pdf(full_text: str) -> dict:
+    """
+    Parse CAMS CAS text into {isin: fund_dict}. Charge lines (***) are folded
+    into the preceding non-charge transaction's STT / Stamp Duty / TDS columns.
+    Uses the SAME logic as qsif_pipeline.py parse_funds().
+    """
+    fund_blocks = re.split(r"(?=Folio No:)", full_text)
+    funds = {}
+
+    for block in fund_blocks[1:]:
+        isin_m = re.search(r"ISIN:\s*(\S+)", block)
+        if not isin_m:
             continue
-    return None
-
-
-def parse_cas_pdf(text: str) -> dict:
-    funds = {isin: [] for isin in QUANT_SIF_ISINS}
-    lines = text.split("\n")
-    current_isin = None
-
-    txn_re = re.compile(
-        r"^(\d{2}-[A-Za-z]{3}-\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{3})\s+([\d,]+\.\d{4})\s+([\d,]+\.\d{3})\s*$"
-    )
-    isin_re = re.compile(r"ISIN:\s*(INF966L\d{5})")
-
-    for line in lines:
-        m_isin = isin_re.search(line)
-        if m_isin:
-            isin = m_isin.group(1)
-            if isin in QUANT_SIF_ISINS:
-                current_isin = isin
-            elif isin == LIQUID_FUND_ISIN:
-                current_isin = None
+        isin = isin_m.group(1)
+        if isin not in QUANT_SIF_ISINS:
             continue
 
-        if not current_isin:
-            continue
-
-        m_txn = txn_re.match(line.strip())
-        if not m_txn:
-            continue
-
-        date_s, desc, amount_s, units_s, nav_s, balance_s = m_txn.groups()
-        d = parse_date(date_s)
-        if not d:
-            continue
-        amount = parse_num(amount_s)
-        units = parse_num(units_s)
-        nav = parse_num(nav_s)
-        balance = parse_num(balance_s)
-
-        if amount > 0:
-            txn_type = "NFO Purchase" if "NFO" in desc else "New Purchase"
-            if "Additional" in desc:
-                txn_type = "Additional Purchase"
-            if "Lateral" in desc and "In" in desc:
-                txn_type = "Lateral Shift In"
-            stamp = round(amount * STAMP_DUTY_RATE, 2)
-            stt = 0.0
+        # Closing CAMS line
+        closing = re.search(
+            r"Closing Unit Balance:\s*([\d,]+\.\d+).*?NAV on\s*\d{2}-[A-Za-z]{3}-\d{4}:\s*INR\s*([\d,]+\.\d+).*?"
+            r"Total Cost Value:\s*([\d,]+\.\d+)",
+            block, re.DOTALL,
+        )
+        if closing:
+            remaining_units = float(closing.group(1).replace(",", ""))
+            cams_closing_nav = float(closing.group(2).replace(",", ""))
+            cams_cost = float(closing.group(3).replace(",", ""))
         else:
-            txn_type = "Redemption, STT" if "STT" in desc else "Redemption"
-            if "Lateral" in desc and "Out" in desc:
-                txn_type = "Lateral Shift Out, STT"
-            stamp = 0.0
-            stt = round(abs(amount) * STT_RATE, 2) if "STT" in desc else 0.0
+            remaining_units = 0.0
+            cams_closing_nav = None
+            cams_cost = 0.0
 
-        funds[current_isin].append({
-            "date": d.strftime("%d-%b-%Y"),
-            "fund": f"Quant SIF - {QUANT_SIF_ISINS[current_isin]} - Direct Plan",
-            "isin": current_isin,
-            "type": txn_type,
-            "amount": amount,
-            "stt": stt,
-            "stamp_duty": stamp,
-            "tds": 0.0,
-            "units": units,
-            "nav": nav,
-            "balance": balance,
-            "notes": "Purchase" if amount > 0 else "Redemption net of TDS/STT",
-        })
+        # Walk lines; fold charge lines into the last non-charge transaction
+        transactions = []
+        last_idx = -1
+        for raw in block.split("\n"):
+            line = raw.strip()
+            if re.match(r"\d{2}-[A-Z][a-z]{2}-\d{4}\s+To\s+\d{2}-[A-Z][a-z]{2}-\d{4}", line):
+                continue
+            if "Address Updated from CVL Data" in line:
+                continue
+            if re.match(r"(Nominee|Opening Unit Balance|Closing Unit Balance|Total Cost Value|Market Value|NAV on|Entry Load|Exit Load|Graded Exit|Folio No|PAN:|KYC:|Registrar|Statement Date|This Consolidated|This statement|This CAS|Email Id|Mobile|investor friendly|registered|common to|missing from|consolidate all|check with|reverse|brought to|of your family|list the|Period:|^\W*$|JOVIN VINCENT|Address:|KERALA|KOTTAYAM|INDIA|PLASSANAL|MEENACHIL|THALAPPALAM|S/O VINCENT JOSEPH|OLAYATHIL|PAN Number|S\.O\.)", line):
+                continue
+
+            date_match = re.match(r"(\d{2}-[A-Z][a-z]{2}-\d{4})\s+(.+)", line)
+            if not date_match:
+                continue
+            date_str = date_match.group(1)
+            rest = date_match.group(2)
+
+            # Charge line
+            charge_m = re.search(r"\*+\s*([^*]+?)\s*\*+\s*\(?(-?[\d,]+\.?\d*)\)?\s*$", rest)
+            if charge_m and "***" in rest:
+                charge_type = charge_m.group(1).strip()
+                try:
+                    amount = float(charge_m.group(2).replace(",", "").replace("(", "-").replace(")", ""))
+                except ValueError:
+                    amount = 0.0
+                if last_idx >= 0:
+                    ct = charge_type.lower()
+                    if "stt" in ct:
+                        transactions[last_idx]["stt"] = amount
+                    elif "tds" in ct:
+                        transactions[last_idx]["tds"] = amount
+                    elif "stamp" in ct:
+                        transactions[last_idx]["stamp_duty"] = amount
+                continue
+
+            # Regular transaction
+            clean = re.sub(r"\(NAV Dt\s*:\s*\d{2}/\d{2}/\d{4}\)", "", rest)
+            clean = re.sub(r"\s+less\s+(TDS|STT|TDS,\s*STT|TDS,STT)", "", clean)
+            nums = re.findall(r"\(?-?[\d,]+\.\d+\)?", clean)
+            if len(nums) >= 4:
+                amount = parse_num(nums[-4])
+                units = parse_num(nums[-3])
+                nav = parse_num(nums[-2])
+                balance = parse_num(nums[-1])
+                first_num_pos = clean.find(nums[0])
+                ttype = clean[:first_num_pos].strip()
+                ttype = re.split(r"\s*\*\*\*", ttype)[0].strip()
+                ttype = re.sub(r"\s+(Trxn\.Ref\.No\..*|less.*|Inter Bank.*)$", "", ttype).strip()
+                is_p = ("Purchase" in ttype or "Shift In" in ttype or "New Purchase" in ttype)
+                tx = {
+                    "date": date_str, "type": ttype,
+                    "amount": amount, "units": units, "nav": nav, "balance": balance,
+                    "stt": 0.0,
+                    "stamp_duty": round(amount * STAMP_DUTY_RATE, 2) if is_p else 0.0,
+                    "tds": 0.0,
+                }
+                transactions.append(tx)
+                last_idx = len(transactions) - 1
+
+        funds[isin] = {
+            "name": QUANT_SIF_NAMES[isin],
+            "isin": isin,
+            "cams_cost_value": cams_cost,
+            "cams_remaining_units": remaining_units,
+            "cams_closing_nav": cams_closing_nav,
+            "transactions": transactions,
+        }
     return funds
 
 
@@ -177,13 +210,15 @@ def build_excel(funds: dict) -> bytes:
         "Holding Days", "Period", "Exit Load (₹)", "Notes",
     ]
 
-    for isin, sheet_name in QUANT_SIF_ISINS.items():
+    for isin in QUANT_SIF_ISINS_ORDERED:
+        sheet_name = QUANT_SIF_NAMES[isin]
         ws = wb.create_sheet(sheet_name)
-        txns = funds.get(isin, [])
+        fund = funds.get(isin, {"transactions": [], "cams_cost_value": 0, "cams_remaining_units": 0})
+        txns = fund["transactions"]
 
         # Row 1: Title
         ws.merge_cells("A1:T1")
-        c = ws.cell(row=1, column=1, value=QUANT_SIF_ISINS[isin])
+        c = ws.cell(row=1, column=1, value=sheet_name)
         c.font = title_font
         c.fill = title_fill
         c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
@@ -204,7 +239,7 @@ def build_excel(funds: dict) -> bytes:
             r = 4 + i
             units = t["units"]
             if units > 0:
-                stamp = t["stamp_duty"]
+                stamp = t.get("stamp_duty", 0)
                 cpu = (t["amount"] + stamp) / units
                 lots.append({"units": units, "cpu": cpu, "date": t["date"]})
             elif units < 0:
@@ -223,17 +258,20 @@ def build_excel(funds: dict) -> bytes:
             balance = sum(l["units"] for l in lots)
             total_cost = sum(l["units"] * l["cpu"] for l in lots)
 
+            ttype = t["type"]
+            is_buy = ("Purchase" in ttype or "Shift In" in ttype)
             row_vals = [
-                i + 1, t["date"], t["fund"], t["isin"], t["type"],
-                t["amount"], t["stt"], t["stamp_duty"], t["tds"],
+                i + 1, t["date"], f"Quant SIF - {sheet_name} - Direct Plan", isin, ttype,
+                t["amount"], t.get("stt", 0), t.get("stamp_duty", 0), t.get("tds", 0),
                 round(t["units"] * t["nav"], 3) if t["nav"] else None,
                 t["units"], t["nav"], None,
                 round(balance, 3), round(total_cost, 2),
-                None, None, None, t["notes"],
+                None, None, None,
+                "Purchase" if is_buy else "Redemption net of TDS/STT",
             ]
             for col, v in enumerate(row_vals, start=1):
                 c = ws.cell(row=r, column=col, value=v)
-                c.font = purchase_font if (t["amount"] or 0) > 0 else redeem_font
+                c.font = purchase_font if is_buy else redeem_font
                 c.alignment = Alignment(horizontal="center" if col in (1, 4, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19) else "left", vertical="center")
                 c.border = border
             ws.row_dimensions[r].height = 18
@@ -247,7 +285,7 @@ def build_excel(funds: dict) -> bytes:
             total_lot_units = sum(l["units"] for l in lots)
             if total_lot_units > 0:
                 wd = sum(
-                    l["units"] * (XIRR_VALUATION_DATE - parse_date(l["date"])).days
+                    l["units"] * (XIRR_VALUATION_DATE - datetime.strptime(l["date"], "%d-%b-%Y")).days
                     for l in lots
                 ) / total_lot_units
             else:
@@ -305,7 +343,7 @@ def build_excel(funds: dict) -> bytes:
 
 
 # ============================================================================
-# STREAMLIT UI - One-click with auto password handling
+# STREAMLIT UI
 # ============================================================================
 
 st.set_page_config(
@@ -317,7 +355,7 @@ st.set_page_config(
 st.title("📊 CAMS CAS → Portfolio Excel")
 st.write("Upload your CAMS PDF. Excel downloads automatically.")
 
-with st.expander("⚙️ PDF password (pre-filled with your default — edit if needed)"):
+with st.expander("⚙️ PDF password (pre-filled with default — edit if needed)"):
     pdf_password = st.text_input(
         "PDF password",
         type="password",
@@ -344,12 +382,12 @@ if uploaded is not None:
             st.info("👉 Open the 'PDF password' section above and try entering your password (or PAN number).")
             st.stop()
 
-    total_txn = sum(len(v) for v in funds.values())
+    total_txn = sum(len(f["transactions"]) for f in funds.values())
     if total_txn == 0:
         st.warning("No transactions found. Check password or PDF format.")
         st.stop()
 
-    st.success(f"✅ {total_txn} transactions parsed")
+    st.success(f"✅ {total_txn} transactions parsed across 5 funds")
     st.download_button(
         label="📥 Download Excel",
         data=xlsx_bytes,
