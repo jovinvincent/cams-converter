@@ -37,14 +37,33 @@ STAMP_DUTY_RATE = 0.00005
 STT_RATE = 0.00001
 XIRR_VALUATION_DATE = datetime(2026, 7, 10)
 
+# Common CAMS PDF passwords to try if user doesn't enter one
+COMMON_PASSWORDS = ["jovi31490", "", "IPRU9999", "CAMSCAS", "CAS123", "12345678", "password"]
+
 
 # ============================================================================
 # PDF PARSING
 # ============================================================================
 
 def extract_pdf_text(pdf_bytes: bytes, password: str = "") -> str:
-    with pdfplumber.open(io.BytesIO(pdf_bytes), password=password or None) as pdf:
-        return "\n".join(p.extract_text() or "" for p in pdf.pages)
+    """Try the given password first, then common defaults."""
+    passwords_to_try = [password] if password else []
+    passwords_to_try.extend(p for p in COMMON_PASSWORDS if p != password)
+
+    last_err = None
+    for pwd in passwords_to_try:
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes), password=pwd or None) as pdf:
+                return "\n".join(page.extract_text() or "" for page in pdf.pages)
+        except Exception as e:
+            last_err = e
+            continue
+
+    # If all failed, raise the last error
+    raise RuntimeError(
+        f"Could not open PDF with any password. Tried: {passwords_to_try}. "
+        f"Last error: {last_err}"
+    )
 
 
 def parse_num(s: str) -> float:
@@ -286,7 +305,7 @@ def build_excel(funds: dict) -> bytes:
 
 
 # ============================================================================
-# STREAMLIT UI - One-click
+# STREAMLIT UI - One-click with auto password handling
 # ============================================================================
 
 st.set_page_config(
@@ -298,6 +317,15 @@ st.set_page_config(
 st.title("📊 CAMS CAS → Portfolio Excel")
 st.write("Upload your CAMS PDF. Excel downloads automatically.")
 
+with st.expander("⚙️ PDF password (pre-filled with your default — edit if needed)"):
+    pdf_password = st.text_input(
+        "PDF password",
+        type="password",
+        value="jovi31490",
+        help="Default is 'jovi31490'. Edit if your PDF uses a different password.",
+    )
+    st.caption("💡 Default password 'jovi31490' is pre-filled. Edit only if needed.")
+
 uploaded = st.file_uploader(
     "Choose CAMS PDF",
     type=["pdf"],
@@ -308,12 +336,12 @@ if uploaded is not None:
     with st.spinner("Processing PDF..."):
         try:
             pdf_bytes = uploaded.read()
-            text = extract_pdf_text(pdf_bytes, "")
+            text = extract_pdf_text(pdf_bytes, pdf_password)
             funds = parse_cas_pdf(text)
             xlsx_bytes = build_excel(funds)
         except Exception as e:
             st.error(f"❌ Failed: {e}")
-            st.info("If PDF is password-protected, edit app.py to set DEFAULT_PASSWORD.")
+            st.info("👉 Open the 'PDF password' section above and try entering your password (or PAN number).")
             st.stop()
 
     total_txn = sum(len(v) for v in funds.values())
@@ -329,3 +357,4 @@ if uploaded is not None:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
+
