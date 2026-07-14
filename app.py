@@ -33,6 +33,14 @@ QUANT_SIF_NAMES = {
     "INF966L30241": "Active Asset Allocator Long-",
     "INF966L30076": "Hybrid Long-Short Fund",
 }
+# Full fund names (used in title and column C) — not truncated
+QUANT_SIF_FULL_NAMES = {
+    "INF966L30019": "Equity Long-Short Fund",
+    "INF966L30159": "Equity Ex-Top 100 Long-Short Fund Direct Plan",
+    "INF966L30274": "Sector Rotation LongShort Fund",
+    "INF966L30241": "Active Asset Allocator Long-Short Fund Direct Plan",
+    "INF966L30076": "Hybrid Long-Short Fund",
+}
 LIQUID_FUND_ISIN = "INF966L01820"
 
 LATEST_NAV = {
@@ -45,7 +53,9 @@ LATEST_NAV = {
 
 STAMP_DUTY_RATE = 0.00005
 STT_RATE = 0.00001
-XIRR_VALUATION_DATE = datetime(2026, 7, 10)
+# CAMS statement date (used for holding days calculation)
+STATEMENT_DATE = datetime(2026, 7, 8)
+XIRR_VALUATION_DATE = datetime(2026, 7, 10)  # last trading day (for XIRR only)
 
 COMMON_PASSWORDS = ["jovi31490", "", "IPRU9999", "CAMSCAS", "CAS123", "12345678", "password"]
 
@@ -212,13 +222,20 @@ def build_excel(funds: dict) -> bytes:
 
     for isin in QUANT_SIF_ISINS_ORDERED:
         sheet_name = QUANT_SIF_NAMES[isin]
+        full_name = QUANT_SIF_FULL_NAMES[isin]
+        full_title = f"{full_name}    (ISIN: {isin})"
+        # Column C: "Quant SIF - " + full name, adding " - Direct Plan" suffix only if not already present
+        if full_name.endswith("Direct Plan"):
+            fund_c_name = f"Quant SIF - {full_name}"
+        else:
+            fund_c_name = f"Quant SIF - {full_name} - Direct Plan"
         ws = wb.create_sheet(sheet_name)
         fund = funds.get(isin, {"transactions": [], "cams_cost_value": 0, "cams_remaining_units": 0})
         txns = fund["transactions"]
 
-        # Row 1: Title
+        # Row 1: Title (full fund name + ISIN)
         ws.merge_cells("A1:T1")
-        c = ws.cell(row=1, column=1, value=sheet_name)
+        c = ws.cell(row=1, column=1, value=full_title)
         c.font = title_font
         c.fill = title_fill
         c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
@@ -238,22 +255,37 @@ def build_excel(funds: dict) -> bytes:
         for i, t in enumerate(txns):
             r = 4 + i
             units = t["units"]
+            txn_date = datetime.strptime(t["date"], "%d-%b-%b" if False else "%d-%b-%Y")
             if units > 0:
+                # BUY: add to lots, holding days = days from txn to statement date
                 stamp = t.get("stamp_duty", 0)
                 cpu = (t["amount"] + stamp) / units
                 lots.append({"units": units, "cpu": cpu, "date": t["date"]})
+                holding_days = (STATEMENT_DATE - txn_date).days
             elif units < 0:
+                # SELL: FIFO consume oldest lots first, holding days = weighted avg of consumed lots
                 to_sell = abs(units)
                 new_lots = []
+                consumed_weighted_days = 0.0
+                consumed_total = 0.0
                 for lot in lots:
                     if to_sell <= 0:
                         new_lots.append(lot)
                         continue
                     take = min(lot["units"], to_sell)
+                    lot_date = datetime.strptime(lot["date"], "%d-%b-%Y")
+                    lot_holding = (txn_date - lot_date).days
+                    consumed_weighted_days += take * lot_holding
+                    consumed_total += take
                     if lot["units"] - take > 1e-9:
                         new_lots.append({"units": lot["units"] - take, "cpu": lot["cpu"], "date": lot["date"]})
                     to_sell -= take
                 lots = new_lots
+                # Holding days for the sell = weighted avg of consumed lots' holding periods
+                # Use round() (not int()) to avoid floating-point truncation issues
+                holding_days = round(consumed_weighted_days / consumed_total) if consumed_total > 0 else 0
+            else:
+                holding_days = 0
 
             balance = sum(l["units"] for l in lots)
             total_cost = sum(l["units"] * l["cpu"] for l in lots)
@@ -261,13 +293,16 @@ def build_excel(funds: dict) -> bytes:
             ttype = t["type"]
             is_buy = ("Purchase" in ttype or "Shift In" in ttype)
             row_vals = [
-                i + 1, t["date"], f"Quant SIF - {sheet_name} - Direct Plan", isin, ttype,
-                t["amount"], t.get("stt", 0), t.get("stamp_duty", 0), t.get("tds", 0),
-                round(t["units"] * t["nav"], 3) if t["nav"] else None,
-                t["units"], t["nav"], None,
-                round(balance, 3), round(total_cost, 2),
-                None, None, None,
-                "Purchase" if is_buy else "Redemption net of TDS/STT",
+                i + 1, t["date"], fund_c_name, isin, ttype,  # A-E
+                t["amount"], t.get("stt", 0), t.get("stamp_duty", 0), t.get("tds", 0),  # F-I
+                None,  # J (Total Invested) - empty in target format
+                t["units"], t["nav"], None,  # K-M
+                round(balance, 3), round(total_cost, 2),  # N-O
+                None,  # P (Cost/Unit) - empty
+                holding_days,  # Q (Holding Days) - days to STATEMENT for buy, FIFO lot age for sell
+                None,  # R (Period) - empty
+                None,  # S (Exit Load) - empty
+                "Purchase" if is_buy else "Redemption net of TDS/STT",  # T (Notes)
             ]
             for col, v in enumerate(row_vals, start=1):
                 c = ws.cell(row=r, column=col, value=v)
@@ -323,10 +358,9 @@ def build_excel(funds: dict) -> bytes:
 
             ws.cell(row=sr_xirr, column=1, value="  XIRR (Annualized)").font = summary_font
             ws.cell(row=sr_xirr, column=1).alignment = Alignment(horizontal="left", vertical="center", indent=1)
-            cc = ws.cell(row=sr_xirr, column=5, value=round(xirr, 2))
+            cc = ws.cell(row=sr_xirr, column=5, value=None)
             cc.font = summary_font
             cc.alignment = Alignment(horizontal="right", vertical="center", indent=1)
-            cc.number_format = '0.00"%"'
 
             for r in (sr_summary, sr_cost, sr_bal, sr_xirr):
                 ws.row_dimensions[r].height = 22
