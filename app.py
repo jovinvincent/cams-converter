@@ -393,10 +393,10 @@ with st.expander("⚙️ PDF password (pre-filled with default — edit if neede
     pdf_password = st.text_input(
         "PDF password",
         type="password",
-        value="jovi31490",
-        help="Default is 'jovi31490'. Edit if your PDF uses a different password.",
+        value="Jovin@123456",
+        help="Default is 'Jovin@123456'. Edit if your PDF uses a different password.",
     )
-    st.caption("💡 Default password 'jovi31490' is pre-filled. Edit only if needed.")
+    st.caption("💡 Default password 'Jovin@123456' is pre-filled. Edit only if needed.")
 
 uploaded = st.file_uploader(
     "Choose CAMS PDF",
