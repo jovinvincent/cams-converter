@@ -62,6 +62,7 @@ STATEMENT_DATE = datetime(2026, 7, 8)
 XIRR_VALUATION_DATE = datetime(2026, 7, 10)  # last trading day (for XIRR only)
 # Keep the established QSIF dates unchanged; the new Quant MF folio uses its own CAS date.
 STATEMENT_DATES = {"INF966L01EJ3": datetime(2026, 10, 28)}
+XIRR_VALUATION_DATES = {"INF966L01EJ3": datetime(2026, 10, 28)}
 
 COMMON_PASSWORDS = ["jovi31490", "", "IPRU9999", "CAMSCAS", "CAS123", "12345678", "password"]
 
@@ -329,7 +330,7 @@ def build_excel(funds: dict) -> bytes:
             total_lot_units = sum(l["units"] for l in lots)
             if total_lot_units > 0:
                 wd = sum(
-                    l["units"] * (XIRR_VALUATION_DATE - datetime.strptime(l["date"], "%d-%b-%Y")).days
+                    l["units"] * (XIRR_VALUATION_DATES.get(isin, XIRR_VALUATION_DATE) - datetime.strptime(l["date"], "%d-%b-%Y")).days
                     for l in lots
                 ) / total_lot_units
             else:
