@@ -23,6 +23,7 @@ QUANT_SIF_ISINS_ORDERED = [
     "INF966L30274",  # Sector Rotation Long-Short Fund
     "INF966L30241",  # Active Asset Allocator Long-Short Fund
     "INF966L30076",  # Hybrid Long-Short Fund
+    "INF966L01EJ3",  # Quant Income Plus Arbitrage Active FoF
 ]
 QUANT_SIF_ISINS = set(QUANT_SIF_ISINS_ORDERED)
 
@@ -32,6 +33,7 @@ QUANT_SIF_NAMES = {
     "INF966L30274": "Sector Rotation LongShort Fu",
     "INF966L30241": "Active Asset Allocator Long-",
     "INF966L30076": "Hybrid Long-Short Fund",
+    "INF966L01EJ3": "Income Plus Arbitrage",
 }
 # Full fund names (used in title and column C) — not truncated
 QUANT_SIF_FULL_NAMES = {
@@ -40,6 +42,7 @@ QUANT_SIF_FULL_NAMES = {
     "INF966L30274": "Sector Rotation LongShort Fund",
     "INF966L30241": "Active Asset Allocator Long-Short Fund Direct Plan",
     "INF966L30076": "Hybrid Long-Short Fund",
+    "INF966L01EJ3": "Quant Income Plus Arbitrage Active FoF - Direct Plan",
 }
 LIQUID_FUND_ISIN = "INF966L01820"
 
@@ -49,6 +52,7 @@ LATEST_NAV = {
     "INF966L30274": 10.3595,
     "INF966L30241": 10.7997,
     "INF966L30076": 10.7412,
+    "INF966L01EJ3": 10.0936,  # NAV from CAMS CAS dated 27-Oct-2026
 }
 
 STAMP_DUTY_RATE = 0.00005
@@ -56,6 +60,8 @@ STT_RATE = 0.00001
 # CAMS statement date (used for holding days calculation)
 STATEMENT_DATE = datetime(2026, 7, 8)
 XIRR_VALUATION_DATE = datetime(2026, 7, 10)  # last trading day (for XIRR only)
+# Keep the established QSIF dates unchanged; the new Quant MF folio uses its own CAS date.
+STATEMENT_DATES = {"INF966L01EJ3": datetime(2026, 10, 28)}
 
 COMMON_PASSWORDS = ["jovi31490", "", "IPRU9999", "CAMSCAS", "CAS123", "12345678", "password"]
 
@@ -225,7 +231,9 @@ def build_excel(funds: dict) -> bytes:
         full_name = QUANT_SIF_FULL_NAMES[isin]
         full_title = f"{full_name}    (ISIN: {isin})"
         # Column C: "Quant SIF - " + full name, adding " - Direct Plan" suffix only if not already present
-        if full_name.endswith("Direct Plan"):
+        if isin == "INF966L01EJ3":
+            fund_c_name = f"Quant MF - {full_name}"
+        elif full_name.endswith("Direct Plan"):
             fund_c_name = f"Quant SIF - {full_name}"
         else:
             fund_c_name = f"Quant SIF - {full_name} - Direct Plan"
@@ -256,12 +264,13 @@ def build_excel(funds: dict) -> bytes:
             r = 4 + i
             units = t["units"]
             txn_date = datetime.strptime(t["date"], "%d-%b-%b" if False else "%d-%b-%Y")
+            statement_date = STATEMENT_DATES.get(isin, STATEMENT_DATE)
             if units > 0:
                 # BUY: add to lots, holding days = days from txn to statement date
                 stamp = t.get("stamp_duty", 0)
                 cpu = (t["amount"] + stamp) / units
                 lots.append({"units": units, "cpu": cpu, "date": t["date"]})
-                holding_days = (STATEMENT_DATE - txn_date).days
+                holding_days = (statement_date - txn_date).days
             elif units < 0:
                 # SELL: FIFO consume oldest lots first, holding days = weighted avg of consumed lots
                 to_sell = abs(units)
@@ -421,7 +430,7 @@ if uploaded is not None:
         st.warning("No transactions found. Check password or PDF format.")
         st.stop()
 
-    st.success(f"✅ {total_txn} transactions parsed across 5 funds")
+    st.success(f"✅ {total_txn} transactions parsed across {len(funds)} funds")
     st.download_button(
         label="📥 Download Excel",
         data=xlsx_bytes,
